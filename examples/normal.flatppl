@@ -1,0 +1,7 @@
+n = external(posintegers)
+data = external(cartpow(cartprod(y = reals), n))
+mu = elementof(reals)
+score(y, m) = logdensityof(Normal(m, 1.0), y)
+total = sum(broadcast(score, data.y, mu))
+inputs = (n, data, mu)
+outputs = total

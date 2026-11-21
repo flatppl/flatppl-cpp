@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""Build a native FlatPPL model library and its C++ header."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from zipfile import BadZipFile
+
+from toolchains import BuildError, flatppl_compiler, iree_tools, lock_directory, run
+
+ROOT = Path(__file__).resolve().parent
+TYPES = {
+    "f32": ("float", "FLATPPL_F32", "real"),
+    "f64": ("double", "FLATPPL_F64", "real"),
+    "i32": ("std::int32_t", "FLATPPL_I32", "integer"),
+    "i64": ("std::int64_t", "FLATPPL_I64", "integer"),
+    "ui64": ("std::uint64_t", "FLATPPL_U64", None),
+    "i1": ("std::uint8_t", "FLATPPL_BOOL", "boolean"),
+}
+CPP_KEYWORDS = {
+    "alignas",
+    "alignof",
+    "and",
+    "and_eq",
+    "asm",
+    "auto",
+    "bitand",
+    "bitor",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "char8_t",
+    "char16_t",
+    "char32_t",
+    "class",
+    "compl",
+    "concept",
+    "const",
+    "consteval",
+    "constexpr",
+    "constinit",
+    "const_cast",
+    "continue",
+    "co_await",
+    "co_return",
+    "co_yield",
+    "decltype",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "dynamic_cast",
+    "else",
+    "enum",
+    "explicit",
+    "export",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "friend",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "mutable",
+    "namespace",
+    "new",
+    "noexcept",
+    "not",
+    "not_eq",
+    "nullptr",
+    "operator",
+    "or",
+    "or_eq",
+    "private",
+    "protected",
+    "public",
+    "register",
+    "reinterpret_cast",
+    "requires",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "static_assert",
+    "static_cast",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "thread_local",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typeid",
+    "typename",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "wchar_t",
+    "while",
+    "xor",
+    "xor_eq",
+}
+FUNCTION = re.compile(
+    r"^\s*func\.func @([a-zA-Z_]\w*)\s*\(([^()]*)\)"
+    r"(?:\s*->\s*(\([^()]*\)|tensor<[^<>]+>))?\s*\{",
+    re.MULTILINE,
+)
+TENSOR = re.compile(r"tensor<((?:[0-9]+x|\?x)*)(f32|f64|i32|i64|ui64|i1)>")
+
+
+@dataclass(frozen=True)
+class Leaf:
+    name: str
+    scalar: str | None
+    count: str | None = None
+
+
+@dataclass(frozen=True)
+class Tensor:
+    dtype: str
+    shape: tuple[int, ...]
+
+
+def identifier(name):
+    result = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_") or "field"
+    if result[0].isdigit() or result in CPP_KEYWORDS:
+        return "fp_" + result
+    return result
+
+
+def tag(node, name):
+    return isinstance(node, list) and bool(node) and node[0] == name
+
+
+def node_meta(node):
+    return node.get("%meta", {}) if isinstance(node, dict) else {}
+
+
+def unwrap(node):
+    return node_meta(node).get("expr", node)
+
+
+def reference(node):
+    node = unwrap(node)
+    if isinstance(node, dict):
+        ref = node.get("%ref", {})
+        if ref.get("ns") == "self":
+            return ref["name"]
+    return None
+
+
+def signature_entries(node):
+    node = unwrap(node)
+    if tag(node, "tuple"):
+        return node[1:]
+    return [] if node is None else [node]
+
+
+def scalar_kind(typ):
+    while isinstance(typ, list) and typ and typ[0] in ("%array", "%tvector"):
+        typ = typ[-1]
+    if tag(typ, "%scalar"):
+        return typ[1]["const"]
+    return None
+
+
+def flatten(typ, expr, prefix, bindings, count=None):
+    if typ is None:
+        typ = node_meta(expr).get("type")
+    ref = reference(expr)
+    if ref in bindings:
+        target = bindings[ref]
+        return flatten(typ, target, prefix or ref, bindings, count)
+    expr = unwrap(expr)
+    if typ is not None and (tag(typ, "%record") or tag(typ, "%table")):
+        fields = typ[1:] if typ[0] == "%record" else typ[1][1:]
+        return [
+            leaf
+            for name, field_type in fields
+            for leaf in flatten(
+                field_type,
+                None,
+                f"{prefix}.{name}" if prefix else name,
+                bindings,
+                count,
+            )
+        ]
+    if tag(typ, "%tuple") or tag(expr, "tuple"):
+        types = (
+            typ[1:]
+            if typ is not None and tag(typ, "%tuple")
+            else [None] * (len(expr) - 1)
+        )
+        values = expr[1:] if tag(expr, "tuple") else [None] * len(types)
+        return [
+            leaf
+            for i, (kind, item) in enumerate(zip(types, values), 1)
+            for leaf in flatten(
+                kind, item, f"{prefix or 'result'}.{i}", bindings, count
+            )
+        ]
+    return [Leaf(prefix or "result", scalar_kind(typ), count)]
+
+
+def leading_count(expr, bindings):
+    expr = unwrap(expr)
+    if tag(expr, "external") and len(expr) >= 2:
+        domain = unwrap(expr[1])
+    elif tag(expr, "load_data") and len(expr) >= 3:
+        domain = unwrap(expr[2])
+    elif tag(expr, "elementof") and len(expr) >= 2:
+        domain = unwrap(expr[1])
+    else:
+        target = reference(expr)
+        return leading_count(bindings[target], bindings) if target in bindings else None
+    if tag(domain, "cartpow") and len(domain) == 3:
+        return reference(domain[2])
+    return None
+
+
+def flatpir_signature(source):
+    module = source["%module"]
+    bindings = {binding["name"]: binding["expr"] for binding in module["binds"]}
+    inputs = []
+    for expr in signature_entries(bindings.get("inputs")):
+        name = reference(expr)
+        if name not in bindings:
+            raise BuildError("each FlatPPL input must name a binding")
+        binding = bindings[name]
+        inputs.extend(
+            flatten(None, binding, name, bindings, leading_count(binding, bindings))
+        )
+
+    outputs = []
+    expressions = signature_entries(bindings.get("outputs"))
+    for i, expr in enumerate(expressions, 1):
+        default = f"result_{i}" if len(expressions) > 1 else ""
+        outputs.extend(flatten(None, expr, reference(expr) or default, bindings))
+    return inputs, outputs
+
+
+def parse_tensor(text):
+    match = TENSOR.fullmatch(text.strip())
+    if not match:
+        raise BuildError(f"unsupported StableHLO tensor type {text.strip()!r}")
+    dimensions, dtype = match.groups()
+    shape = tuple(-1 if dim == "?" else int(dim) for dim in dimensions.split("x")[:-1])
+    if any(dim > (1 << 63) - 1 for dim in shape):
+        raise BuildError("tensor dimension exceeds int64")
+    return Tensor(dtype, shape)
+
+
+def stablehlo_signature(text):
+    functions = list(FUNCTION.finditer(text))
+    if len(functions) != 1:
+        raise BuildError("expected one exported StableHLO function")
+    name, arguments, results = functions[0].groups()
+    inputs = [
+        parse_tensor(item.split(":", 1)[1])
+        for item in arguments.split(",")
+        if item.strip()
+    ]
+    outputs = [
+        parse_tensor(item)
+        for item in (results or "").strip("()").split(",")
+        if item.strip()
+    ]
+    status = re.search(r"\bflatppl\.runtime_status\s*=\s*(\d+)\s*:", text)
+    status_bytes = 0
+    if status:
+        if int(status[1]) != len(outputs) - 1 or outputs[-1] not in (
+            Tensor("i32", ()),
+            Tensor("i64", ()),
+        ):
+            raise BuildError("unsupported FlatPPL runtime status result")
+        status_bytes = 4 if outputs.pop().dtype == "i32" else 8
+    return "module." + name, inputs, outputs, status_bytes
+
+
+def match_fields(leaves, tensors, direction):
+    if len(leaves) != len(tensors):
+        raise BuildError(
+            f"{direction}: FlatPIR has {len(leaves)} leaves, StableHLO has {len(tensors)} tensors"
+        )
+    used = set()
+    for leaf, tensor in zip(leaves, tensors):
+        scalar = TYPES[tensor.dtype][2]
+        if leaf.scalar is not None and scalar is not None and scalar != leaf.scalar:
+            raise BuildError(
+                f"{leaf.name}: FlatPIR and StableHLO disagree about the element type"
+            )
+        name = identifier(leaf.name)
+        if name in used:
+            raise BuildError(f"{direction}: C++ field name {name!r} collides")
+        used.add(name)
+    return list(zip(leaves, tensors))
+
+
+def cpp_type(tensor, container):
+    element = TYPES[tensor.dtype][0]
+    if tensor.shape:
+        return f"flatppl::{container}<{element}, {len(tensor.shape)}>"
+    return element
+
+
+def cpp_header(name, symbol, inputs, outputs):
+    fields_in = "\n".join(
+        f"  {cpp_type(tensor, 'TensorView')} {identifier(leaf.name)};"
+        for leaf, tensor in inputs
+    )
+    fields_out = "\n".join(
+        f"  {cpp_type(tensor, 'Tensor')} {identifier(leaf.name)};"
+        for leaf, tensor in outputs
+    )
+    descriptors = []
+    for leaf, tensor in inputs:
+        field = "input." + identifier(leaf.name)
+        descriptors.append(
+            field + ".descriptor()" if tensor.shape else f"flatppl::scalar({field})"
+        )
+    reads = []
+    for index, (_, tensor) in enumerate(outputs):
+        element = TYPES[tensor.dtype][0]
+        reader = (
+            f"read_tensor<{element}, {len(tensor.shape)}>"
+            if tensor.shape
+            else f"read_scalar<{element}>"
+        )
+        reads.append(f"flatppl::{reader}(results[{index}])")
+    args = ",\n        ".join(descriptors)
+    returns = ",\n        ".join(reads)
+    return f"""#pragma once
+#include "flatppl.hpp"
+
+extern "C" const flatppl_model_api* {symbol}(void);
+
+namespace flatppl::{name} {{
+
+struct Inputs {{
+{fields_in}
+}};
+
+struct Outputs {{
+{fields_out}
+}};
+
+class Model {{
+ public:
+  static Model linked() {{
+    return Model({symbol}(), {{}});
+  }}
+
+  static Model open(const char* path) {{
+    flatppl::Library library(path);
+    const auto* api = library.api("{symbol}");
+    return Model(api, std::move(library));
+  }}
+
+  Outputs evaluate(const Inputs& input) {{
+    const std::array<flatppl_tensor, {len(inputs)}> args = {{{{
+        {args}
+    }}}};
+    const auto* results = instance_.evaluate(args.data(), args.size());
+    return {{
+        {returns}
+    }};
+  }}
+
+ private:
+  Model(const flatppl_model_api* api, flatppl::Library library)
+      : instance_(api, std::move(library)) {{}}
+
+  flatppl::Instance instance_;
+}};
+
+}}  // namespace flatppl::{name}
+"""
+
+
+def c_fields(name, fields):
+    declarations = []
+    elements = []
+    for index, (leaf, tensor) in enumerate(fields):
+        shape = "NULL"
+        if tensor.shape:
+            shape = f"{name}_shape_{index}"
+            dims = ", ".join(map(str, tensor.shape))
+            declarations.append(f"static const int64_t {shape}[] = {{{dims}}};")
+        elements.append(
+            f"  {{{json.dumps(leaf.name)}, {TYPES[tensor.dtype][1]}, "
+            f"{len(tensor.shape)}, {shape}}},"
+        )
+    entries = "\n".join(elements) if elements else "  {0},"
+    return "\n".join(
+        declarations + [f"static const flatppl_field {name}[] = {{", entries, "};"]
+    )
+
+
+def c_config(symbol, entry, inputs, outputs, status_bytes):
+    max_rank = max([1] + [len(tensor.shape) for _, tensor in inputs + outputs])
+    scalar_inputs = {
+        leaf.name: i
+        for i, (leaf, tensor) in enumerate(inputs)
+        if not tensor.shape and tensor.dtype in ("i32", "i64")
+    }
+    extents = [
+        scalar_inputs.get(leaf.count, -1)
+        if tensor.shape and tensor.shape[0] == -1
+        else -1
+        for leaf, tensor in inputs
+    ]
+    counts = ", ".join(map(str, extents or [-1]))
+    return f"""#define MODEL_SYMBOL {symbol}
+#define MODEL_ENTRY_POINT {json.dumps(entry)}
+#define INPUT_COUNT {len(inputs)}
+#define OUTPUT_COUNT {len(outputs)}
+#define MAX_RANK {max_rank}
+#define MODEL_STATUS_BYTES {status_bytes}
+
+{c_fields("input_fields", inputs)}
+{c_fields("output_fields", outputs)}
+static const int leading_extent_inputs[] = {{{counts}}};
+"""
+
+
+def embed(module, destination):
+    with destination.open("w", encoding="ascii") as out, module.open("rb") as data:
+        out.write("#include <stddef.h>\n\n")
+        out.write("_Alignas(64) const unsigned char flatppl_module[] = {\n")
+        while chunk := data.read(24):
+            out.write("    " + ", ".join(f"0x{byte:02x}" for byte in chunk) + ",\n")
+        out.write("};\nconst size_t flatppl_module_size = sizeof(flatppl_module);\n")
+
+
+def build(args):
+    out = args.out_dir.resolve()
+    if not args.query.is_file():
+        raise BuildError(f"query not found: {args.query}")
+    if out.exists() and not out.is_dir():
+        raise BuildError(f"output is not a directory: {out}")
+    tool_cache = ROOT / ".build" / "toolchains"
+    flatppl = flatppl_compiler(args.flatppl, args.fetch_flatppl, tool_cache)
+    iree, iree_compile = iree_tools(args, tool_cache)
+    name = identifier(args.name or args.query.stem)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(os.fsencode(out)).hexdigest()[:16]
+    cache = ROOT / ".build" / key
+    with lock_directory(cache / "lock"):
+        build_model(args, out, flatppl, iree, iree_compile, name, cache)
+
+
+def build_model(args, out, flatppl, iree, iree_compile, name, cache):
+    source = cache / "model"
+    source.mkdir(exist_ok=True)
+    query = args.query.resolve()
+    inferred = source / "query.flatpir"
+    flatpir = source / "query.flatpir.json"
+    mlir = source / "query.mlir"
+    vmfb = source / "query.vmfb"
+    run([flatppl, "infer", query, inferred, "--no-header"], quiet=True)
+    run([flatppl, "convert", inferred, flatpir, "--no-header"], quiet=True)
+    options = ["--dtype", args.dtype] if args.dtype else []
+    run(
+        [
+            flatppl,
+            "stablehlo",
+            query,
+            "--restrict-enzyme-compatible=false",
+            *options,
+            "-o",
+            mlir,
+        ],
+        quiet=True,
+    )
+
+    input_leaves, output_leaves = flatpir_signature(json.loads(flatpir.read_text()))
+    entry, input_tensors, output_tensors, status = stablehlo_signature(mlir.read_text())
+    inputs = match_fields(input_leaves, input_tensors, "inputs")
+    outputs = match_fields(output_leaves, output_tensors, "outputs")
+    fingerprint = hashlib.sha256(repr((inputs, outputs, status)).encode()).hexdigest()[
+        :16
+    ]
+    symbol = f"flatppl_query_{name}_{fingerprint}_api_v1"
+    (source / "model_config.h").write_text(
+        c_config(symbol, entry, inputs, outputs, status)
+    )
+    header = cpp_header(name, symbol, inputs, outputs)
+
+    run(
+        [
+            iree_compile,
+            mlir,
+            "--iree-input-type=stablehlo",
+            "--iree-input-demote-f64-to-f32=false",
+            "--iree-hal-target-device=local",
+            "--iree-hal-local-target-device-backends=llvm-cpu",
+            "--iree-llvmcpu-target-cpu=generic",
+            "-o",
+            vmfb,
+        ],
+        quiet=True,
+    )
+    embed(vmfb, source / "model_data.c")
+
+    # Keep the IREE runtime objects across model builds using this checkout.
+    runtime_key = hashlib.sha256(os.fsencode(iree)).hexdigest()[:16]
+    cmake = cache.parent / "runtime" / runtime_key
+    with lock_directory(cmake / "lock"):
+        library, import_file = link_model(args, cmake, iree, source, name, symbol)
+        publish(out, name, header, library, import_file)
+    print(out / library.name)
+    print(out / f"{name}.hpp")
+
+
+def link_model(args, cmake, iree, source, name, symbol):
+    run(
+        [
+            "cmake",
+            "-S",
+            ROOT,
+            "-B",
+            cmake,
+            "-DCMAKE_BUILD_TYPE=Release",
+            f"-DIREE_SOURCE={iree}",
+            f"-DMODEL_SOURCE={source}",
+            f"-DMODEL_NAME={name}",
+            f"-DMODEL_SYMBOL={symbol}",
+        ],
+        quiet=True,
+    )
+    jobs = ["--parallel", str(args.jobs)] if args.jobs else []
+    run(
+        [
+            "cmake",
+            "--build",
+            cmake,
+            "--config",
+            "Release",
+            "--target",
+            "flatppl_generated_model",
+            *jobs,
+        ],
+        quiet=True,
+    )
+    library = Path((cmake / "artifact-Release.txt").read_text().strip())
+    if library.suffix == ".dll":
+        import_file = Path((cmake / "linker-Release.txt").read_text().strip())
+    else:
+        import_file = None
+    return library, import_file
+
+
+def publish(out, name, header, library, import_file):
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as temp:
+        stage = Path(temp)
+        (stage / f"{name}.hpp").write_text(header)
+        artifacts = [
+            ROOT / "include" / "flatppl.h",
+            ROOT / "include" / "flatppl.hpp",
+            library,
+        ]
+        if import_file:
+            artifacts.append(import_file)
+        for path in artifacts:
+            shutil.copy2(path, stage / path.name)
+        for artifact in stage.iterdir():
+            os.replace(artifact, out / artifact.name)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("query", type=Path)
+    parser.add_argument("--out-dir", type=Path, required=True)
+    flatppl = parser.add_mutually_exclusive_group(required=True)
+    flatppl.add_argument("--flatppl", type=Path, help="local FlatPPL executable")
+    flatppl.add_argument(
+        "--fetch-flatppl", action="store_true", help="fetch and build pinned FlatPPL"
+    )
+    iree = parser.add_mutually_exclusive_group(required=True)
+    iree.add_argument("--iree-dir", type=Path, help="local IREE source checkout")
+    iree.add_argument(
+        "--fetch-iree", action="store_true", help="fetch pinned IREE tools and source"
+    )
+    compiler = parser.add_mutually_exclusive_group()
+    compiler.add_argument(
+        "--iree-compile", type=Path, help="local IREE compiler executable"
+    )
+    compiler.add_argument(
+        "--build-iree-from-source",
+        action="store_true",
+        help="build iree-compile and the linker from the selected IREE source",
+    )
+    parser.add_argument(
+        "--dtype", choices=("f32", "f64"), help="default: use FlatPPL's default"
+    )
+    parser.add_argument("--name", help="name of the library and C++ namespace")
+    parser.add_argument("--jobs", type=int, help="parallel CMake build jobs")
+    args = parser.parse_args()
+    if args.jobs is not None and args.jobs < 1:
+        parser.error("--jobs must be positive")
+    try:
+        build(args)
+    except (BuildError, OSError, ValueError, KeyError, BadZipFile) as error:
+        parser.exit(1, f"flatppl-build: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
