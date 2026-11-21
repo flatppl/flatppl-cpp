@@ -44,18 +44,21 @@ before compilation.
 
 ## Call the model
 
-The default `f32` build takes a flat row-major design matrix with columns
-`[1, predictor]`. Pass one coefficient per column and one count per row.
+Each row of the design matrix contains `1` for the intercept and one predictor
+value. Pass one coefficient per column and one observed count per row.
 
 ```cpp
 #include "poisson_regression.hpp"
 
 #include <cstdint>
-#include <vector>
 
 float log_posterior(const char* library_path) {
   auto model = flatppl::poisson_regression::Model::open(library_path);
-  const std::vector<float> x = {1, -1, 1, 0, 1, 2};
+  const float x[3][2] = {
+      {1.0f, -1.0f},
+      {1.0f,  0.0f},
+      {1.0f,  2.0f},
+  };
   const float beta[] = {0.25f, 0.5f};
   const std::int32_t counts[] = {0, 2, 4};
   return model.evaluate(3, x, beta, counts).log_posterior;
@@ -78,9 +81,11 @@ at runtime.
 Pass arguments in the order declared by the FlatPPL query. The wrapper infers
 the shape of a one-dimensional `std::array` or `std::vector`, or a C array
 with one or two dimensions. A matrix with dynamic rows and a fixed column
-count also accepts a flat `std::vector`. Use an explicit tensor view for other
-shapes or raw pointers. Pass one generated argument per record or table with
-multiple fields. The wrapper packs its fields into ordered tensor leaves.
+count also accepts a flat `std::vector` in row order. The wrapper divides the
+vector length by the column count and checks for incomplete rows. Use an
+explicit tensor view for other shapes or raw pointers. Pass one generated
+argument per record or table with multiple fields. The wrapper packs its
+fields into ordered tensor leaves.
 
 Pass tensors in dense row-major order. A dynamic dimension may vary between
 calls. The wrapper checks a leading dimension declared directly by another
