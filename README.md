@@ -93,3 +93,7 @@ Build `examples/linear_regression.flatppl` and configure the same tests with
 design matrix, a length-`P` coefficient vector, and a length-`N` response
 vector. The C++ test calls `model.evaluate(n, x, beta, y)` with 4, 32, 128,
 and 1024 rows on the same model.
+
+## License
+
+[MIT](LICENSE)
