@@ -34,6 +34,9 @@ Add `--build-iree-from-source` to build the compiler from the selected IREE
 source. Use `--iree-dir` with a prepared checkout to build offline. Add
 `--fetch-iree` to authorize fetching source and submodules for the source build.
 
+See [IREE workarounds](docs/workarounds.md) for the StableHLO changes applied
+before compilation.
+
 ## Call the model
 
 Put the generated header directory on the include path. The header works

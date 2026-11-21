@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import BadZipFile
 
+from iree_workarounds import apply_iree_workarounds
 from toolchains import BuildError, flatppl_compiler, iree_tools, lock_directory, run
 
 ROOT = Path(__file__).resolve().parent
@@ -493,7 +494,8 @@ def build_model(args, out, flatppl, iree, iree_compile, name, cache):
     )
 
     input_leaves, output_leaves = flatpir_signature(json.loads(flatpir.read_text()))
-    entry, input_tensors, output_tensors, status = stablehlo_signature(mlir.read_text())
+    stablehlo = mlir.read_text()
+    entry, input_tensors, output_tensors, status = stablehlo_signature(stablehlo)
     inputs = match_fields(input_leaves, input_tensors, "inputs")
     outputs = match_fields(output_leaves, output_tensors, "outputs")
     fingerprint = hashlib.sha256(repr((inputs, outputs, status)).encode()).hexdigest()[
@@ -505,10 +507,12 @@ def build_model(args, out, flatppl, iree, iree_compile, name, cache):
     )
     header = cpp_header(name, symbol, inputs, outputs)
 
+    iree_mlir = source / "query.iree.mlir"
+    iree_mlir.write_text(apply_iree_workarounds(stablehlo))
     run(
         [
             iree_compile,
-            mlir,
+            iree_mlir,
             "--iree-input-type=stablehlo",
             "--iree-input-demote-f64-to-f32=false",
             "--iree-hal-target-device=local",
