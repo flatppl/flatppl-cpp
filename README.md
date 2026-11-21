@@ -50,16 +50,20 @@ with C++17 and later. Add the generated library to the link command when using
 float score(const char* library_path) {
   auto model = flatppl::normal::Model::open(library_path);
   const float observations[] = {0, 1, 2, 3};
-  const auto result = model.evaluate({4, {observations, 4, {4}}, 1.0f});
+  const auto result = model.evaluate(4, observations, 1.0f);
   return result.total;
 }
 ```
 
-The generated names follow the query signature. Record and table fields
-flatten into ordered tensor leaves. Pass tensors in dense row-major order.
-The tensor view carries an element count and shape. A dynamic dimension may
-vary between calls. The generated wrapper also checks a leading dimension
-declared directly by another scalar input, as in the Normal example.
+Pass arguments in the order declared by the FlatPPL query. The wrapper infers
+the shape of a one-dimensional `std::array` or `std::vector`, or a C array
+with one or two dimensions. Use an explicit tensor view for other ranks or
+raw pointers. Pass one generated argument per record or table with
+multiple fields. The wrapper packs its fields into ordered tensor leaves.
+
+Pass tensors in dense row-major order. A dynamic dimension may vary between
+calls. The wrapper checks a leading dimension declared directly by another
+scalar input, as in the Normal example.
 
 Reuse a model instance across calls. Pass observations and parameters each
 time. Give concurrent callers separate instances. C++ results own their data.
@@ -83,3 +87,9 @@ ctest --test-dir build/tests -C Release --output-on-failure
 Both consumers compare the same model library against the analytic Normal
 log likelihood at two observation counts and check rejection of an inconsistent
 count.
+
+Build `examples/linear_regression.flatppl` and configure the same tests with
+`-DMODEL_NAME=linear_regression`. The model takes a row count, an `N×P`
+design matrix, a length-`P` coefficient vector, and a length-`N` response
+vector. The C++ test calls `model.evaluate(n, x, beta, y)` with 4, 32, 128,
+and 1024 rows on the same model.

@@ -1,0 +1,13 @@
+flatppl_compat = "0.1"
+
+n = external(posintegers)
+x = external(cartpow(reals, [n, 2]))
+beta = elementof(cartpow(reals, 2))
+y = external(cartpow(reals, n))
+
+prediction = x * beta
+score(observed, mean) = logdensityof(Normal(mean, 1.0), observed)
+total = sum(broadcast(score, y, prediction))
+
+inputs = (n, x, beta, y)
+outputs = (prediction, total)

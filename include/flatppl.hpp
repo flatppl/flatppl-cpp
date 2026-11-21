@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,29 @@ struct TensorView {
   const T* data;
   std::size_t size;
   std::array<std::uint64_t, Rank> shape;
+
+  TensorView() = default;
+  TensorView(const T* buffer, std::size_t count,
+             std::array<std::uint64_t, Rank> dimensions)
+      : data(buffer), size(count), shape(dimensions) {}
+
+  template <std::size_t N, std::size_t R = Rank,
+            std::enable_if_t<R == 1, int> = 0>
+  TensorView(const T (&values)[N]) : TensorView(values, N, {N}) {}
+
+  template <std::size_t N, std::size_t R = Rank,
+            std::enable_if_t<R == 1, int> = 0>
+  TensorView(const std::array<T, N>& values)
+      : TensorView(values.data(), N, {N}) {}
+
+  template <std::size_t R = Rank, std::enable_if_t<R == 1, int> = 0>
+  TensorView(const std::vector<T>& values)
+      : TensorView(values.data(), values.size(), {values.size()}) {}
+
+  template <std::size_t Rows, std::size_t Columns, std::size_t R = Rank,
+            std::enable_if_t<R == 2, int> = 0>
+  TensorView(const T (&values)[Rows][Columns])
+      : TensorView(values[0], Rows * Columns, {Rows, Columns}) {}
 
   flatppl_tensor descriptor() const {
     if (size > (std::numeric_limits<std::size_t>::max)() / sizeof(T)) {

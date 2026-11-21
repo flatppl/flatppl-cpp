@@ -234,7 +234,10 @@ def leading_count(expr, bindings):
         target = reference(expr)
         return leading_count(bindings[target], bindings) if target in bindings else None
     if tag(domain, "cartpow") and len(domain) == 3:
-        return reference(domain[2])
+        dimensions = unwrap(domain[2])
+        if tag(dimensions, "vector"):
+            return reference(dimensions[1]) if len(dimensions) > 1 else None
+        return reference(dimensions)
     return None
 
 
@@ -247,9 +250,12 @@ def flatpir_signature(source):
         if name not in bindings:
             raise BuildError("each FlatPPL input must name a binding")
         binding = bindings[name]
-        inputs.extend(
-            flatten(None, binding, name, bindings, leading_count(binding, bindings))
+        leaves = flatten(
+            None, binding, name, bindings, leading_count(binding, bindings)
         )
+        if not leaves:
+            raise BuildError(f"{name}: input has no tensor fields")
+        inputs.append((name, leaves))
 
     outputs = []
     expressions = signature_entries(bindings.get("outputs"))
@@ -323,21 +329,53 @@ def cpp_type(tensor, container):
     return element
 
 
-def cpp_header(name, symbol, inputs, outputs):
-    fields_in = "\n".join(
-        f"  {cpp_type(tensor, 'TensorView')} {identifier(leaf.name)};"
-        for leaf, tensor in inputs
+def cpp_arguments(input_groups, inputs):
+    declarations = []
+    parameters = []
+    descriptors = []
+    input_types = {leaf.name: tensor for leaf, tensor in inputs}
+    used = set()
+    for name, leaves in input_groups:
+        parameter = identifier(name)
+        if parameter in used:
+            raise BuildError(f"inputs: C++ parameter name {parameter!r} collides")
+        used.add(parameter)
+        members = []
+        for leaf in leaves:
+            tensor = input_types[leaf.name]
+            field = parameter
+            if len(leaves) > 1:
+                member = identifier(leaf.name[len(name) + 1 :])
+                member_type = cpp_type(tensor, "TensorView")
+                members.append(f"  {member_type} {member};")
+                field = f"{parameter}.{member}"
+            descriptors.append(
+                f"{field}.descriptor()"
+                if tensor.shape
+                else f"::flatppl::scalar({field})"
+            )
+        if members:
+            argument_type = f"Input_{parameter}"
+            declarations.append(
+                f"struct {argument_type} {{\n" + "\n".join(members) + "\n};\n"
+            )
+            parameters.append(f"const struct {argument_type}& {parameter}")
+        else:
+            argument_type = cpp_type(input_types[leaves[0].name], "TensorView")
+            parameters.append(f"{argument_type} {parameter}")
+    return (
+        "\n".join(declarations),
+        ", ".join(parameters),
+        ",\n        ".join(descriptors),
     )
+
+
+def cpp_header(name, symbol, input_groups, inputs, outputs):
+    declarations, parameters, args = cpp_arguments(input_groups, inputs)
     fields_out = "\n".join(
         f"  {cpp_type(tensor, 'Tensor')} {identifier(leaf.name)};"
         for leaf, tensor in outputs
     )
-    descriptors = []
-    for leaf, tensor in inputs:
-        field = "input." + identifier(leaf.name)
-        descriptors.append(
-            field + ".descriptor()" if tensor.shape else f"flatppl::scalar({field})"
-        )
     reads = []
     for index, (_, tensor) in enumerate(outputs):
         element = TYPES[tensor.dtype][0]
@@ -346,8 +384,7 @@ def cpp_header(name, symbol, inputs, outputs):
             if tensor.shape
             else f"read_scalar<{element}>"
         )
-        reads.append(f"flatppl::{reader}(results[{index}])")
-    args = ",\n        ".join(descriptors)
+        reads.append(f"::flatppl::{reader}(results_[{index}])")
     returns = ",\n        ".join(reads)
     return f"""#pragma once
 #include "flatppl.hpp"
@@ -356,11 +393,7 @@ extern "C" const flatppl_model_api* {symbol}(void);
 
 namespace flatppl::{name} {{
 
-struct Inputs {{
-{fields_in}
-}};
-
-struct Outputs {{
+{declarations}struct Outputs {{
 {fields_out}
 }};
 
@@ -376,11 +409,12 @@ class Model {{
     return Model(api, std::move(library));
   }}
 
-  Outputs evaluate(const Inputs& input) {{
-    const std::array<flatppl_tensor, {len(inputs)}> args = {{{{
+  Outputs evaluate({parameters}) {{
+    const std::array<flatppl_tensor, {len(inputs)}> input_tensors_ = {{{{
         {args}
     }}}};
-    const auto* results = instance_.evaluate(args.data(), args.size());
+    const auto* results_ =
+        instance_.evaluate(input_tensors_.data(), input_tensors_.size());
     return {{
         {returns}
     }};
@@ -493,7 +527,8 @@ def build_model(args, out, flatppl, iree, iree_compile, name, cache):
         quiet=True,
     )
 
-    input_leaves, output_leaves = flatpir_signature(json.loads(flatpir.read_text()))
+    input_groups, output_leaves = flatpir_signature(json.loads(flatpir.read_text()))
+    input_leaves = [leaf for _, group in input_groups for leaf in group]
     stablehlo = mlir.read_text()
     entry, input_tensors, output_tensors, status = stablehlo_signature(stablehlo)
     inputs = match_fields(input_leaves, input_tensors, "inputs")
@@ -505,7 +540,7 @@ def build_model(args, out, flatppl, iree, iree_compile, name, cache):
     (source / "model_config.h").write_text(
         c_config(symbol, entry, inputs, outputs, status)
     )
-    header = cpp_header(name, symbol, inputs, outputs)
+    header = cpp_header(name, symbol, input_groups, inputs, outputs)
 
     iree_mlir = source / "query.iree.mlir"
     iree_mlir.write_text(apply_iree_workarounds(stablehlo))
