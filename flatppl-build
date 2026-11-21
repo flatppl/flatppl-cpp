@@ -608,11 +608,40 @@ def link_model(args, cmake, iree, source, name, symbol):
     return library, import_file
 
 
+def cmake_package(name, library, import_file):
+    target = f"flatppl::{name}"
+    headers = f"{target}::headers"
+    config = f"""if(TARGET {target})
+  return()
+endif()
+
+add_library({headers} INTERFACE IMPORTED)
+set_target_properties({headers} PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES "${{CMAKE_CURRENT_LIST_DIR}}"
+  INTERFACE_COMPILE_FEATURES cxx_std_17
+  INTERFACE_LINK_LIBRARIES "${{CMAKE_DL_LIBS}}")
+
+add_library({target} SHARED IMPORTED)
+set_target_properties({target} PROPERTIES
+  IMPORTED_LOCATION "${{CMAKE_CURRENT_LIST_DIR}}/{library.name}"
+  INTERFACE_LINK_LIBRARIES {headers})
+"""
+    if import_file:
+        config += (
+            f"set_property(TARGET {target} PROPERTY IMPORTED_IMPLIB\n"
+            f'  "${{CMAKE_CURRENT_LIST_DIR}}/{import_file.name}")\n'
+        )
+    return config
+
+
 def publish(out, name, header, library, import_file):
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as temp:
         stage = Path(temp)
         (stage / f"{name}.hpp").write_text(header)
+        (stage / f"{name}Config.cmake").write_text(
+            cmake_package(name, library, import_file)
+        )
         artifacts = [
             ROOT / "include" / "flatppl.h",
             ROOT / "include" / "flatppl.hpp",
