@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.26)
 project(flatppl_cpp_tests LANGUAGES CXX)
 enable_testing()
 
-set(MODEL_NAME normal CACHE STRING "FlatPPL example to test")
+set(MODEL_NAME poisson_regression CACHE STRING "FlatPPL example to test")
 set("${MODEL_NAME}_DIR" "${MODEL_DIR}")
 find_package("${MODEL_NAME}" CONFIG REQUIRED NO_DEFAULT_PATH)
 set(model_target "flatppl::${MODEL_NAME}")

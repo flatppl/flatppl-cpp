@@ -26,3 +26,8 @@ module {
 
 Remove the workaround once the minimum supported IREE version compiles this
 module and runs it at multiple row counts.
+
+## Double-precision math on macOS arm64
+
+The pinned IREE compiler's embedded ELF linker fails to resolve `exp`, `log`,
+and `sin` in the `f64` Poisson regression example. Build the example in `f32`.

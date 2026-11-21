@@ -1,0 +1,24 @@
+%%%
+Poisson regression with independent standard Normal priors on the coefficients.
+The first design column contains ones for the intercept.
+%%%
+flatppl_compat = "0.1"
+
+n = external(posintegers)
+x = external(cartpow(reals, [n, 2]))
+counts = external(cartpow(nonnegintegers, n))
+
+coefficients ~ iid(Normal(0.0, 1.0), 2)
+log_rate = x * coefficients
+y ~ Poisson.(exp.(log_rate))
+
+prior = lawof(record(coefficients = coefficients))
+kernel = kernelof(record(y = y), coefficients = coefficients)
+likelihood = likelihoodof(kernel, record(y = counts))
+posterior = bayesupdate(likelihood, prior)
+
+beta = elementof(cartpow(reals, 2))
+log_posterior = logdensityof(posterior, record(coefficients = beta))
+
+inputs = (n, x, beta, counts)
+outputs = log_posterior
