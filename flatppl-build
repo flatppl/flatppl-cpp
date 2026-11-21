@@ -329,6 +329,13 @@ def cpp_type(tensor, container):
     return element
 
 
+def cpp_input_type(tensor):
+    shape = tensor.shape
+    if len(shape) == 2 and shape[0] == -1 and shape[1] > 0:
+        return f"flatppl::MatrixView<{TYPES[tensor.dtype][0]}, {shape[1]}>"
+    return cpp_type(tensor, "TensorView")
+
+
 def cpp_arguments(input_groups, inputs):
     declarations = []
     parameters = []
@@ -346,7 +353,7 @@ def cpp_arguments(input_groups, inputs):
             field = parameter
             if len(leaves) > 1:
                 member = identifier(leaf.name[len(name) + 1 :])
-                member_type = cpp_type(tensor, "TensorView")
+                member_type = cpp_input_type(tensor)
                 members.append(f"  {member_type} {member};")
                 field = f"{parameter}.{member}"
             descriptors.append(
@@ -361,7 +368,7 @@ def cpp_arguments(input_groups, inputs):
             )
             parameters.append(f"const struct {argument_type}& {parameter}")
         else:
-            argument_type = cpp_type(input_types[leaves[0].name], "TensorView")
+            argument_type = cpp_input_type(input_types[leaves[0].name])
             parameters.append(f"{argument_type} {parameter}")
     return (
         "\n".join(declarations),

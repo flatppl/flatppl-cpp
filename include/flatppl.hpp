@@ -59,6 +59,18 @@ struct TensorView {
   }
 };
 
+template <typename T, std::size_t Columns>
+struct MatrixView : TensorView<T, 2> {
+  static_assert(Columns > 0);
+  using TensorView<T, 2>::TensorView;
+
+  MatrixView() = default;
+  MatrixView(TensorView<T, 2> view) : TensorView<T, 2>(view) {}
+  MatrixView(const std::vector<T>& values)
+      : TensorView<T, 2>(values.data(), values.size(),
+                         {values.size() / Columns, Columns}) {}
+};
+
 template <typename T, std::size_t Rank>
 struct Tensor {
   std::vector<T> data;
